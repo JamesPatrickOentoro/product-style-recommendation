@@ -44,6 +44,8 @@ DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-005")
 DEFAULT_EMBEDDING_TASK = os.getenv("EMBEDDING_TASK_TYPE", "RETRIEVAL_DOCUMENT")
 DEFAULT_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_LIMIT = int(os.getenv("PRODUCT_LIMIT", "30"))
+DEFAULT_HOST = os.getenv("APP_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.getenv("APP_PORT", "7860"))
 
 
 @dataclass
@@ -412,6 +414,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SERVICE_ACCOUNT_KEY,
         help="Path to patrick-dev-sa service account JSON",
     )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Gradio server bind address")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Gradio server port")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--share", action="store_true", help="Enable Gradio sharing link")
     parser.add_argument("--debug", action="store_true")
@@ -459,7 +463,11 @@ def main() -> None:
     )
     logging.info("Loaded %s products. Launching Gradio interface…", len(products))
     app = create_interface(engine, products)
-    app.launch(share=args.share)
+    app.launch(
+        share=args.share,
+        server_name=args.host,
+        server_port=args.port,
+    )
 
 
 if __name__ == "__main__":
