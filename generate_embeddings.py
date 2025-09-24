@@ -25,6 +25,7 @@ try:
         TextEmbeddingInput,
         TextEmbeddingModel,
     )
+    from google.oauth2 import service_account
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency. Install with: pip install google-cloud-aiplatform"
@@ -52,6 +53,7 @@ class AppConfig:
     dry_run: bool = False
     embedding_task_type: str = DEFAULT_TASK_TYPE
     embedding_output_dim: Optional[int] = None
+    service_account_key: Optional[str] = None
 
 
 class EmbeddingClient:
@@ -64,6 +66,7 @@ class EmbeddingClient:
         model_name: str,
         task_type: str,
         output_dimensionality: Optional[int] = None,
+        service_account_key: Optional[str] = None,
     ) -> None:
         self._model_name = model_name
         self._task_type = task_type
@@ -81,7 +84,20 @@ class EmbeddingClient:
             model_name,
             location,
         )
-        vertexai.init(project=project_id, location=location)
+
+        credentials = None
+        if service_account_key:
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_key,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+                logging.warning(
+                    "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
+                    credentials.service_account_email,
+                )
+
+        vertexai.init(project=project_id, location=location, credentials=credentials)
         try:
             self._model = TextEmbeddingModel.from_pretrained(model_name)
         except Exception as exc:  # pragma: no cover
@@ -217,6 +233,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=None, help="Optional upper bound on rows to update")
     parser.add_argument("--dry-run", action="store_true", help="Compute embeddings but do not persist")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
+    parser.add_argument(
+        "--service-account-key",
+        default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+        help="Path to patrick-dev-sa service account JSON",
+    )
     return parser.parse_args()
 
 
@@ -247,6 +268,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         dry_run=args.dry_run,
         embedding_task_type=args.embedding_task_type,
         embedding_output_dim=args.embedding_output_dim,
+        service_account_key=args.service_account_key,
     )
 
 
@@ -274,6 +296,7 @@ def main() -> None:
             config.embedding_model,
             config.embedding_task_type,
             config.embedding_output_dim,
+            config.service_account_key,
         )
 
         processed = 0

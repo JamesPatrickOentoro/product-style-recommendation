@@ -27,6 +27,7 @@ try:
     import vertexai
     from vertexai.generative_models import GenerationConfig, GenerativeModel
     from vertexai.preview.language_models import TextEmbeddingInput, TextEmbeddingModel
+    from google.oauth2 import service_account
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency. Install with: pip install google-cloud-aiplatform gradio"
@@ -41,6 +42,7 @@ DEFAULT_VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 DEFAULT_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-005")
 DEFAULT_EMBEDDING_TASK = os.getenv("EMBEDDING_TASK_TYPE", "RETRIEVAL_DOCUMENT")
+DEFAULT_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_LIMIT = int(os.getenv("PRODUCT_LIMIT", "30"))
 
 
@@ -181,6 +183,7 @@ class RecommendationEngine:
         embedding_model_name: str,
         embedding_task_type: str,
         embedding_output_dim: Optional[int] = None,
+        service_account_key: Optional[str] = None,
     ) -> None:
         self._repo = repo
         self._products = products
@@ -191,7 +194,19 @@ class RecommendationEngine:
         self._embedding_task_type = embedding_task_type
         self._embedding_output_dim = embedding_output_dim
 
-        vertexai.init(project=project_id, location=location)
+        credentials = None
+        if service_account_key:
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_key,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+                logging.warning(
+                    "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
+                    credentials.service_account_email,
+                )
+
+        vertexai.init(project=project_id, location=location, credentials=credentials)
         self._gen_model = GenerativeModel(model_name)
         self._embedding_model = TextEmbeddingModel.from_pretrained(embedding_model_name)
 
@@ -386,6 +401,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional reduced embedding dimensionality",
     )
+    parser.add_argument(
+        "--service-account-key",
+        default=DEFAULT_SERVICE_ACCOUNT_KEY,
+        help="Path to patrick-dev-sa service account JSON",
+    )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--share", action="store_true", help="Enable Gradio sharing link")
     parser.add_argument("--debug", action="store_true")
@@ -397,6 +417,7 @@ def build_dsn(args: argparse.Namespace) -> str:
         "db password": args.db_password,
         "vertex project": args.vertex_project,
         "embedding model": args.embedding_model,
+        "service account key": args.service_account_key,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
@@ -429,6 +450,7 @@ def main() -> None:
         args.embedding_model,
         args.embedding_task_type,
         args.embedding_output_dim,
+        args.service_account_key,
     )
     logging.info("Loaded %s products. Launching Gradio interface…", len(products))
     app = create_interface(engine, products)
