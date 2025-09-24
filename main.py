@@ -3,8 +3,9 @@
 
 This Gradio app loads apparel records with image URLs and pgvector embeddings,
 shows them in a gallery, and lets the user pick one. When a product is selected
-we compute similar items via cosine similarity and ask Gemini 2.5 Flash to
-recommend the best alternative, returning the suggestion and image preview.
+we feed the product narrative (``pdt_desc``) to Gemini 2.5 Flash, ask it to
+write a fresh description for a complementary item, embed that generated copy,
+and look up the nearest neighbours inside Cloud SQL to suggest the top match.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from psycopg2.extras import DictCursor
 try:
     import vertexai
     from vertexai.generative_models import GenerationConfig, GenerativeModel
+    from vertexai.preview.language_models import TextEmbeddingInput, TextEmbeddingModel
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency. Install with: pip install google-cloud-aiplatform gradio"
@@ -37,6 +39,8 @@ DEFAULT_DB_USER = os.getenv("DB_USER", "postgres")
 DEFAULT_VERTEX_PROJECT = os.getenv("VERTEX_PROJECT")
 DEFAULT_VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 DEFAULT_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-005")
+DEFAULT_EMBEDDING_TASK = os.getenv("EMBEDDING_TASK_TYPE", "RETRIEVAL_DOCUMENT")
 DEFAULT_LIMIT = int(os.getenv("PRODUCT_LIMIT", "30"))
 
 
@@ -98,6 +102,49 @@ class ProductRepository:
             )
         return products
 
+    def find_similar_by_vector(
+        self,
+        vector: Sequence[float],
+        limit: int,
+        exclude_id: Optional[int] = None,
+    ) -> List[Tuple[Product, float]]:
+        vector_literal = format_vector(vector)
+
+        base_query = (
+            "SELECT id, category, sub_category, uri, image, COALESCE(pdt_desc, content) AS description, "
+            "embedding::text AS embedding_text, embedding <=> %s::vector AS distance "
+            "FROM apparels WHERE embedding IS NOT NULL"
+        )
+        params: List[object] = [vector_literal]
+
+        if exclude_id is not None:
+            base_query += " AND id <> %s"
+            params.append(exclude_id)
+
+        base_query += " ORDER BY embedding <=> %s::vector LIMIT %s"
+        params.extend([vector_literal, limit])
+
+        with psycopg2.connect(self._dsn, cursor_factory=DictCursor) as conn:
+            with conn.cursor() as cur:
+                cur.execute(base_query, params)
+                rows = cur.fetchall()
+
+        neighbours: List[Tuple[Product, float]] = []
+        for row in rows:
+            product = Product(
+                product_id=row["id"],
+                category=row["category"],
+                sub_category=row["sub_category"],
+                uri=row["uri"],
+                image=row["image"],
+                description=row["description"],
+                embedding=parse_embedding(row["embedding_text"]),
+            )
+            distance = float(row["distance"])
+            neighbours.append((product, distance))
+
+        return neighbours
+
 
 def parse_embedding(value: Optional[str]) -> List[float]:
     if value is None:
@@ -119,133 +166,125 @@ def cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def format_vector(vector: Sequence[float]) -> str:
+    return "[" + ",".join(f"{value:.12g}" for value in vector) + "]"
+
+
 class RecommendationEngine:
     def __init__(
         self,
+        repo: ProductRepository,
         products: List[Product],
         project_id: str,
         location: str,
         model_name: str,
+        embedding_model_name: str,
+        embedding_task_type: str,
+        embedding_output_dim: Optional[int] = None,
     ) -> None:
+        self._repo = repo
         self._products = products
         self._project_id = project_id
         self._location = location
         self._model_name = model_name
+        self._embedding_model_name = embedding_model_name
+        self._embedding_task_type = embedding_task_type
+        self._embedding_output_dim = embedding_output_dim
+
         vertexai.init(project=project_id, location=location)
-        self._model = GenerativeModel(model_name)
+        self._gen_model = GenerativeModel(model_name)
+        self._embedding_model = TextEmbeddingModel.from_pretrained(embedding_model_name)
 
-    def top_candidates(self, source: Product, k: int = 5) -> List[Tuple[Product, float]]:
-        scores: List[Tuple[Product, float]] = []
-        for candidate in self._products:
-            if candidate.product_id == source.product_id:
-                continue
-            score = cosine_similarity(source.embedding, candidate.embedding)
-            scores.append((candidate, score))
-        scores.sort(key=lambda item: item[1], reverse=True)
-        return scores[:k]
-
-    def recommend(self, source: Product, k: int = 5) -> Dict[str, str]:
-        candidates = self.top_candidates(source, k=k)
-        if not candidates:
-            return {"message": "No candidate products available."}
-
-        candidate_payload = []
-        for candidate, score in candidates:
-            snippet = ", ".join(f"{value:.3f}" for value in candidate.embedding[:15])
-            candidate_payload.append(
-                {
-                    "id": candidate.product_id,
-                    "category": candidate.category,
-                    "sub_category": candidate.sub_category,
-                    "description": candidate.short_description(200),
-                    "similarity": round(score, 4),
-                    "embedding_snippet": snippet,
-                }
-            )
-
-        prompt = self._build_prompt(source, candidate_payload)
-        logging.debug("Gemini prompt: %s", prompt)
-
-        response = self._model.generate_content(
+    def recommend(self, source: Product, k: int = 5) -> Dict[str, object]:
+        logging.debug("Requesting Gemini recommendation for product %s", source.product_id)
+        prompt = self._build_prompt(source)
+        response = self._gen_model.generate_content(
             prompt,
-            generation_config=GenerationConfig(temperature=0.3, max_output_tokens=512),
+            generation_config=GenerationConfig(temperature=0.9, max_output_tokens=256),
         )
         text = response.text if hasattr(response, "text") else str(response)
         logging.debug("Gemini raw response: %s", text)
 
-        recommendation = self._parse_response(text, candidate_payload)
+        gen_payload = self._parse_generation_response(text)
+        generated_desc = gen_payload.get("generated_description")
+        if not generated_desc:
+            logging.warning("Gemini response missing 'generated_description'. Falling back to original pdt_desc.")
+            generated_desc = source.description
+
+        logging.debug("Embedding generated description: %s", generated_desc)
+        embedding = self._embed_text(generated_desc)
+        neighbours = self._repo.find_similar_by_vector(
+            embedding,
+            limit=k,
+            exclude_id=source.product_id,
+        )
+
+        if not neighbours:
+            logging.warning("No neighbours returned for generated description; reverting to preloaded catalogue neighbours.")
+            neighbours = self._fallback_neighbours(source, k)
+
+        results = []
+        for product, distance in neighbours:
+            similarity = max(0.0, 1.0 - distance)
+            results.append(
+                {
+                    "id": product.product_id,
+                    "title": product.title(),
+                    "description": product.short_description(240),
+                    "image": product.image_url,
+                    "distance": round(distance, 4),
+                    "similarity": round(similarity, 4),
+                }
+            )
+
+        recommendation = {
+            "generated_description": generated_desc,
+            "reason": gen_payload.get("reason", "Gemini did not explain the recommendation."),
+            "confidence": gen_payload.get("confidence", "N/A"),
+            "results": results,
+        }
         return recommendation
 
-    def _build_prompt(self, source: Product, candidates: List[Dict[str, object]]) -> str:
-        source_snippet = ", ".join(f"{value:.3f}" for value in source.embedding[:15])
-        prompt = (
-            "You are a retail stylist working with embedding vectors produced by a text-embedding model.\n"
-            "Analyze the user's selected product and choose the single best alternative from the candidate list.\n"
-            "Always justify your choice using category, sub-category, and description.\n"
-            "Respond with JSON containing keys 'recommended_id', 'reason', and 'confidence' (0-1).\n"
-            "Selected product:\n"
-            f"  id: {source.product_id}\n"
-            f"  category: {source.category}\n"
-            f"  sub_category: {source.sub_category}\n"
-            f"  description: {source.short_description(240)}\n"
-            f"  embedding_snippet: [{source_snippet}] (first 15 of {len(source.embedding)} dims)\n"
-            "Candidates:\n"
+    def _fallback_neighbours(self, source: Product, k: int) -> List[Tuple[Product, float]]:
+        scores: List[Tuple[Product, float]] = []
+        for candidate in self._products:
+            if candidate.product_id == source.product_id:
+                continue
+            distance = 1.0 - cosine_similarity(source.embedding, candidate.embedding)
+            scores.append((candidate, distance))
+        scores.sort(key=lambda item: item[1])
+        return scores[:k]
+
+    def _embed_text(self, text: str) -> List[float]:
+        inputs = [TextEmbeddingInput(task_type=self._embedding_task_type, text=text)]
+        kwargs = {}
+        if self._embedding_output_dim is not None:
+            kwargs["output_dimensionality"] = self._embedding_output_dim
+        responses = self._embedding_model.get_embeddings(inputs, **kwargs)
+        if not responses:
+            raise ValueError("Embedding model returned no results")
+        return list(responses[0].values)
+
+    def _build_prompt(self, source: Product) -> str:
+        return (
+            "You are a fashion stylist. Study the given product description and propose a complementary"
+            " apparel item. Respond with ONE line only, no quotes, no JSON, and no commentary.\n"
+            "Your line must look like a concise product description, e.g. 'Girls Tops Red Casual Gini and Jony Girls Red Top'.\n"
+            "Do not copy the wording verbatim from the input—choose a complementary category, colour, or style."
+            "\nInput product description:\n"
+            f"{source.description}\n"
         )
-        for candidate in candidates:
-            prompt += (
-                f"- id: {candidate['id']}, category: {candidate['category']}, "
-                f"sub_category: {candidate['sub_category']}, similarity: {candidate['similarity']}, "
-                f"description: {candidate['description']}, embedding_snippet: [{candidate['embedding_snippet']}]\n"
-            )
-        prompt += "If the candidates are unsuitable, choose the closest match but note any limitations in the reason."
-        return prompt
 
-    def _parse_response(
-        self, text: str, candidates: List[Dict[str, object]]
-    ) -> Dict[str, str]:
-        try:
-            payload = json.loads(text)
-            recommended_id = int(payload.get("recommended_id"))
-            reason = payload.get("reason", "Gemini did not provide a reason.")
-            confidence = payload.get("confidence")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            logging.warning("Failed to parse Gemini response as JSON. Falling back to top candidate.")
-            top_candidate = candidates[0]
-            recommended_id = top_candidate["id"]  # type: ignore[index]
-            reason = (
-                "Falling back to highest cosine similarity match. "
-                f"Candidate {recommended_id} with similarity {top_candidate['similarity']}"
-            )
-            confidence = None
+    def _parse_generation_response(self, text: str) -> Dict[str, object]:
+        cleaned = text.strip().replace("\n", " ").strip()
+        if not cleaned:
+            cleaned = "No recommendation generated."
 
-        match = next(
-            (product for product in self._products if product.product_id == recommended_id),
-            None,
-        )
-        if match is None:
-            logging.warning(
-                "Gemini picked id %s which is not in the candidate set. Falling back to first candidate.",
-                recommended_id,
-            )
-            top_candidate = candidates[0]
-            match = next(
-                product
-                for product in self._products
-                if product.product_id == top_candidate["id"]
-            )
-            recommended_id = match.product_id
-            if not reason:
-                reason = "Gemini selected an unknown product; defaulted to top cosine match."
-
-        result = {
-            "recommended_id": str(recommended_id),
-            "reason": reason,
-            "confidence": f"{confidence:.2f}" if isinstance(confidence, (float, int)) else "N/A",
-            "recommended_title": match.title(),
-            "recommended_description": match.short_description(240),
-            "recommended_image": match.image_url,
+        return {
+            "generated_description": cleaned,
+            "reason": "Gemini generated a complementary apparel description for embedding lookup.",
+            "confidence": "N/A",
         }
-        return result
 
 
 def build_gallery_payload(products: List[Product]) -> List[Tuple[str, str]]:
@@ -258,34 +297,44 @@ def build_gallery_payload(products: List[Product]) -> List[Tuple[str, str]]:
 def create_interface(engine: RecommendationEngine, products: List[Product]) -> gr.Blocks:
     gallery_items = build_gallery_payload(products)
 
-    def on_select(evt: gr.SelectData) -> Tuple[str, str, str, str]:
+    def on_select(evt: gr.SelectData) -> Tuple[str, str, List[Tuple[str, str]], str]:
         index = evt.index
         if index is None or index < 0 or index >= len(products):
             return (
                 "No product selected.",
                 "",
-                "",
+                [],
                 "",
             )
         product = products[index]
         rec = engine.recommend(product)
+        top_result = rec["results"][0] if rec.get("results") else None
         selected_markdown = (
             f"### Selected Product\n"
             f"**{product.title()}**\n\n"
-            f"{product.short_description(400)}\n\n"
+            f"**Input product description**\n\n{product.description}\n\n"
             f"Embedding dims: {len(product.embedding)}"
         )
-        recommendation_md = (
-            f"### Gemini Suggests\n"
-            f"**{rec['recommended_title']}**\n\n"
-            f"{rec['reason']}\n\n"
-            f"Confidence: {rec['confidence']}"
-        )
+        recommendation_md = "### Gemini Suggests\n"
+        recommendation_md += f"**Gemini recommended description**\n\n{rec['generated_description']}\n\n"
+        recommendation_md += f"**Reason:** {rec['reason']}\n\n"
+        recommendation_md += f"**Confidence:** {rec['confidence']}\n"
+        if top_result:
+            recommendation_md += (
+                "\n**Top match from catalogue**\n\n"
+                f"{top_result['title']} (similarity {top_result['similarity']})\n"
+                f"{top_result['description']}"
+            )
+        gallery_payload = [
+            (item["image"], f"{item['title']}\n(similarity {item['similarity']})")
+            for item in rec.get("results", [])
+        ]
+
         return (
             selected_markdown,
             recommendation_md,
-            rec["recommended_image"],
-            json.dumps({k: v for k, v in rec.items() if k != "recommended_image"}, indent=2),
+            gallery_payload,
+            json.dumps(rec, indent=2),
         )
 
     with gr.Blocks(title="Delami Apparel Recommender") as demo:
@@ -301,13 +350,19 @@ def create_interface(engine: RecommendationEngine, products: List[Product]) -> g
             selected_info = gr.Markdown("Select a product to view details.")
             recommendation_info = gr.Markdown("")
         with gr.Row():
-            recommended_image = gr.Image(label="Recommended Product", interactive=False)
+            recommended_gallery = gr.Gallery(
+                label="Top 5 Matches",
+                columns=5,
+                show_label=True,
+                height=240,
+                interactive=False,
+            )
             raw_json = gr.Code(label="Recommendation payload", language="json")
 
         gallery.select(
             on_select,
             inputs=None,
-            outputs=[selected_info, recommendation_info, recommended_image, raw_json],
+            outputs=[selected_info, recommendation_info, recommended_gallery, raw_json],
         )
 
     return demo
@@ -323,6 +378,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vertex-project", default=DEFAULT_VERTEX_PROJECT)
     parser.add_argument("--vertex-location", default=DEFAULT_VERTEX_LOCATION)
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    parser.add_argument("--embedding-task-type", default=DEFAULT_EMBEDDING_TASK)
+    parser.add_argument(
+        "--embedding-output-dim",
+        type=int,
+        default=None,
+        help="Optional reduced embedding dimensionality",
+    )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--share", action="store_true", help="Enable Gradio sharing link")
     parser.add_argument("--debug", action="store_true")
@@ -330,7 +393,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_dsn(args: argparse.Namespace) -> str:
-    required = {"db password": args.db_password, "vertex project": args.vertex_project}
+    required = {
+        "db password": args.db_password,
+        "vertex project": args.vertex_project,
+        "embedding model": args.embedding_model,
+    }
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise SystemExit(f"Missing required configuration: {', '.join(missing)}")
@@ -353,7 +420,16 @@ def main() -> None:
     if not products:
         raise SystemExit("No products with embeddings found. Run generate_embeddings.py first.")
 
-    engine = RecommendationEngine(products, args.vertex_project, args.vertex_location, args.model)
+    engine = RecommendationEngine(
+        repo,
+        products,
+        args.vertex_project,
+        args.vertex_location,
+        args.model,
+        args.embedding_model,
+        args.embedding_task_type,
+        args.embedding_output_dim,
+    )
     logging.info("Loaded %s products. Launching Gradio interface…", len(products))
     app = create_interface(engine, products)
     app.launch(share=args.share)

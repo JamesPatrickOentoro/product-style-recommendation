@@ -110,16 +110,7 @@ def fetch_batch(
     limit: int,
     include_description: bool,
 ) -> Tuple[List[int], List[str]]:
-    column_list = [
-        "id",
-        "category",
-        "sub_category",
-        "content",
-        "uri",
-        "image",
-    ]
-    if include_description:
-        column_list.append("pdt_desc")
+    column_list = ["id", "content"]
 
     sql = (
         "SELECT "
@@ -142,14 +133,10 @@ def fetch_batch(
 
 
 def _build_payload(row: dict) -> str:
-    description = row.get("pdt_desc") or ""
-    description = description.strip()
-    if not description:
-        description = (
-            "Category: {category}. Sub-category: {sub_category}. "
-            "Content: {content}. Image URI: {uri}."
-        ).format(**row)
-    return description
+    content = (row.get("content") or "").strip()
+    if not content:
+        raise ValueError(f"Row {row.get('id')} has empty 'content' field; cannot embed")
+    return content
 
 
 def ensure_pdt_desc_column(
