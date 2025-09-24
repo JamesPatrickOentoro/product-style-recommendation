@@ -87,14 +87,20 @@ class EmbeddingClient:
 
         credentials = None
         if service_account_key:
-            credentials = service_account.Credentials.from_service_account_file(
-                service_account_key,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+            if os.path.isfile(service_account_key):
+                credentials = service_account.Credentials.from_service_account_file(
+                    service_account_key,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+                    logging.warning(
+                        "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
+                        credentials.service_account_email,
+                    )
+            else:
                 logging.warning(
-                    "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
-                    credentials.service_account_email,
+                    "Service account key file %s not found. Falling back to Application Default Credentials.",
+                    service_account_key,
                 )
 
         vertexai.init(project=project_id, location=location, credentials=credentials)
@@ -236,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--service-account-key",
         default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-        help="Path to patrick-dev-sa service account JSON",
+        help="Optional path to patrick-dev-sa service account JSON",
     )
     return parser.parse_args()
 

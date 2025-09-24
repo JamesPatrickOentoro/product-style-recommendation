@@ -196,14 +196,20 @@ class RecommendationEngine:
 
         credentials = None
         if service_account_key:
-            credentials = service_account.Credentials.from_service_account_file(
-                service_account_key,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+            if os.path.isfile(service_account_key):
+                credentials = service_account.Credentials.from_service_account_file(
+                    service_account_key,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                if credentials.service_account_email != "patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com":
+                    logging.warning(
+                        "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
+                        credentials.service_account_email,
+                    )
+            else:
                 logging.warning(
-                    "Service account email %s does not match expected patrick-dev-sa@delamibrands-vision-poc.iam.gserviceaccount.com",
-                    credentials.service_account_email,
+                    "Service account key file %s not found. Falling back to Application Default Credentials.",
+                    service_account_key,
                 )
 
         vertexai.init(project=project_id, location=location, credentials=credentials)
@@ -417,7 +423,6 @@ def build_dsn(args: argparse.Namespace) -> str:
         "db password": args.db_password,
         "vertex project": args.vertex_project,
         "embedding model": args.embedding_model,
-        "service account key": args.service_account_key,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
